@@ -6,7 +6,7 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  return res.status(200).send({'message': 'SHIPTIVITY API. Read documentation to see API docs'});
+  return res.status(200).send({ 'message': 'SHIPTIVITY API. Read documentation to see API docs' });
 });
 
 // We are keeping one connection alive for the rest of the life application for simplicity
@@ -26,8 +26,8 @@ const validateId = (id) => {
     return {
       valid: false,
       messageObj: {
-      'message': 'Invalid id provided.',
-      'long_message': 'Id can only be integer.',
+        'message': 'Invalid id provided.',
+        'long_message': 'Id can only be integer.',
       },
     };
   }
@@ -36,8 +36,8 @@ const validateId = (id) => {
     return {
       valid: false,
       messageObj: {
-      'message': 'Invalid id provided.',
-      'long_message': 'Cannot find client with that id.',
+        'message': 'Invalid id provided.',
+        'long_message': 'Cannot find client with that id.',
       },
     };
   }
@@ -55,8 +55,8 @@ const validatePriority = (priority) => {
     return {
       valid: false,
       messageObj: {
-      'message': 'Invalid priority provided.',
-      'long_message': 'Priority can only be positive integer.',
+        'message': 'Invalid priority provided.',
+        'long_message': 'Priority can only be positive integer.',
       },
     };
   }
@@ -92,7 +92,7 @@ app.get('/api/v1/clients', (req, res) => {
  * GET /api/v1/clients/{client_id} - get client by id
  */
 app.get('/api/v1/clients/:id', (req, res) => {
-  const id = parseInt(req.params.id , 10);
+  const id = parseInt(req.params.id, 10);
   const { valid, messageObj } = validateId(id);
   if (!valid) {
     res.status(400).send(messageObj);
@@ -115,21 +115,61 @@ app.get('/api/v1/clients/:id', (req, res) => {
  *
  */
 app.put('/api/v1/clients/:id', (req, res) => {
-  const id = parseInt(req.params.id , 10);
-  const { valid, messageObj } = validateId(id);
+  const { id } = req.params;
+  const targetId = parseInt(id, 10);
+  const { valid, messageObj } = validateId(targetId);
   if (!valid) {
-    res.status(400).send(messageObj);
+    return res.status(400).send(messageObj);
   }
 
-  let { status, priority } = req.body;
-  let clients = db.prepare('select * from clients').all();
-  const client = clients.find(client => client.id === id);
+  const { status, priority } = req.body;
+  const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(targetId);
+  const oldStatus = client.status;
+  const oldPriority = client.priority;
 
-  /* ---------- Update code below ----------*/
+  const updateClient = db.transaction(() => {
+    if (status && status !== oldStatus) {
+      // 1. Shift up priorities in the OLD status swimlane
+      db.prepare('UPDATE clients SET priority = priority - 1 WHERE status = ? AND priority > ?').run(oldStatus, oldPriority);
 
+      // 2. Insert into NEW status swimlane
+      const newStatusCount = db.prepare('SELECT COUNT(*) as count FROM clients WHERE status = ?').get(status).count;
+      let newPriority;
 
+      if (priority !== undefined) {
+        newPriority = Math.min(Math.max(1, priority), newStatusCount + 1);
+        // Shift down existing items in the NEW swimlane to make room
+        db.prepare('UPDATE clients SET priority = priority + 1 WHERE status = ? AND priority >= ?').run(status, newPriority);
+      } else {
+        newPriority = newStatusCount + 1;
+      }
 
-  return res.status(200).send(clients);
+      db.prepare('UPDATE clients SET status = ?, priority = ? WHERE id = ?').run(status, newPriority, targetId);
+    } else if (priority !== undefined && priority !== oldPriority) {
+      // Same status, priority change
+      const swimlaneStatus = status || oldStatus;
+      const swimlaneCount = db.prepare('SELECT COUNT(*) as count FROM clients WHERE status = ?').get(swimlaneStatus).count;
+      const targetPriority = Math.min(Math.max(1, priority), swimlaneCount);
+
+      if (targetPriority > oldPriority) {
+        // Shifting down: priority 2 -> 5. Shift items [3, 4, 5] up by 1.
+        db.prepare('UPDATE clients SET priority = priority - 1 WHERE status = ? AND priority > ? AND priority <= ?').run(swimlaneStatus, oldPriority, targetPriority);
+      } else {
+        // Shifting up: priority 5 -> 2. Shift items [2, 3, 4] down by 1.
+        db.prepare('UPDATE clients SET priority = priority + 1 WHERE status = ? AND priority >= ? AND priority < ?').run(swimlaneStatus, targetPriority, oldPriority);
+      }
+      db.prepare('UPDATE clients SET priority = ? WHERE id = ?').run(targetPriority, targetId);
+    }
+  });
+
+  try {
+    updateClient();
+    const clients = db.prepare('SELECT * FROM clients').all();
+    return res.status(200).send(clients);
+  } catch (error) {
+    console.error('Transaction failed:', error);
+    return res.status(500).send({ message: 'Internal Server Error', long_message: error.message });
+  }
 });
 
 app.listen(3001);
